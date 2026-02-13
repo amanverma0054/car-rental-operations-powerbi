@@ -1,0 +1,124 @@
+import requests
+import json
+import time
+import pandas as pd
+from datetime import datetime, timedelta
+
+# === Import auth handler ===
+from auth_refresh import get_auth_headers   # 👈 uses your existing auth_refresh.py
+
+# === API DETAILS ===
+API_URL = "https://app.indecab.com/api/beta/invoices"   # 👈 invoices API
+
+# === PATH TO SAVE FILE IN ONEDRIVE ===
+ONEDRIVE_PATH = r"C:\Users\lenovo\OneDrive\API Call\unpaid_invoice.xlsx"
+
+
+def get_api_data(headers, body, page=1, limit=1000):
+    """Fetch paginated API data"""
+    all_data = []
+    last_page_data = None
+    while True:
+        body_with_pagination = body.copy()
+        body_with_pagination["page"] = page
+        body_with_pagination["limit"] = limit
+        print(f"  Requesting page {page}...")
+    
+        try:
+            response = requests.post(API_URL, headers=headers, data=json.dumps(body_with_pagination), timeout=120)
+        except requests.exceptions.Timeout:
+            print("  Request timed out.")
+            break
+        except Exception as e:
+            print(f"  Request failed: {e}")
+            break
+
+        # 🔑 If unauthorized (token expired) → refresh and retry once
+        if response.status_code == 401:
+            print("  ⚠️ Token expired, refreshing...")
+            headers = get_auth_headers()
+            continue
+
+        if response.status_code != 200:
+            if "rate limit" in response.text.lower():
+                print("  Rate limit reached. Waiting 60 seconds before retrying...")
+                time.sleep(5)
+                continue
+            print(f"  Error fetching API (page {page}): {response.text}")
+            break
+
+        result = response.json()
+        data_page = result.get("data", [])
+
+        print(f"  Received {len(data_page)} records on page {page}")
+
+        if data_page == last_page_data:
+            print("  Duplicate page data detected, stopping loop.")
+            break
+        last_page_data = data_page
+
+        if not data_page:
+            break
+
+        all_data.extend(data_page)
+
+        if len(data_page) < limit:
+            break
+        page += 1
+
+    return all_data if all_data else None
+
+
+def daterange_chunks(start_date, end_date, chunk_days=7):
+    """Generate 7-day date ranges"""
+    current = start_date
+    while current <= end_date:
+        chunk_end = min(current + timedelta(days=chunk_days - 1), end_date)
+        yield current, chunk_end
+        current = chunk_end + timedelta(days=1)
+
+
+if __name__ == "__main__":
+    # === Always start from 2022-04-01 until today ===
+    start_date = datetime.strptime("2022-04-01", "%Y-%m-%d")
+    end_date = datetime.today()
+
+    # Get valid headers from auth_refresh
+    HEADERS = get_auth_headers()
+
+    all_results = []
+
+    # Only fetch "unpaid"
+    status = "unpaid"
+    print(f"\n=== Fetching {status.upper()} invoices ===")
+    for chunk_start, chunk_end in daterange_chunks(start_date, end_date, 7):
+        start_str = chunk_start.strftime("%Y-%m-%dT00:00:00.000+05:30")
+        end_str = chunk_end.strftime("%Y-%m-%dT23:59:59.000+05:30")
+
+        print(f"\nFetching data for {chunk_start.date()} to {chunk_end.date()}...")
+
+        body = {
+            "invoicePaid": status,      # 👈 unpaid invoices
+            "dateFilter": "date",       # 👈 required filter
+            "dateRange": {
+                "start": start_str,
+                "end": end_str
+            }
+        }
+
+        data = get_api_data(HEADERS, body)
+        if data:
+            for row in data:
+                row["invoicePaid"] = status  # add status column
+            all_results.extend(data)
+        else:
+            print("  No data returned for this chunk.")
+
+        time.sleep(1)  # avoid API rate limit
+
+    if all_results:
+        df = pd.DataFrame(all_results)
+        df.to_excel(ONEDRIVE_PATH, index=False, engine="openpyxl")
+        print(f"\n✅ Saved {len(all_results)} unpaid invoices to OneDrive: {ONEDRIVE_PATH}")
+    else:
+        print("\n❌ No unpaid invoices fetched from API.")
